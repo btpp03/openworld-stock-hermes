@@ -1,0 +1,57 @@
+name: openworld-stock
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "强制推 TG（自检用，忽略冷却）"
+        type: boolean
+        default: false
+      quiet:
+        description: "静默（cron-job.org 外部腿用，正常无货时已静默）"
+        type: boolean
+        default: false
+  schedule:
+    - cron: '*/10 * * * *'   # 备用腿（本账号 GA 原生 schedule 常不 fire，主腿是 cron-job.org）
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openworld-stock
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore state
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+          restore-keys: |
+            state-
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check stock
+        env:
+          OW_COOKIE: ${{ secrets.OW_COOKIE }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          FORCE: ${{ github.event.inputs.force }}
+          QUIET: ${{ github.event.inputs.quiet }}
+        run: python check_stock.py
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
