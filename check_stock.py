@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""openworld.eu.org 免费 VPS 库存监控
+"""openworld.eu.org 免费 VPS 监控
 
-- 用已登录 session cookie 拉 /createvps，解析页内 data-plan JSON 的 stock 字段
-- 免费档 (price == 0) 有库存 → TG 报警（30 分钟内不重复）
-- cookie 失效 → TG 报警（6 小时内不重复）
-- 状态落 state.json，由 Actions cache 滚动保存，避免刷屏
+1) 库存：用已登录 cookie 拉 /createvps，解析 data-plan JSON 的 stock，免费档有货 → TG 报警（30 分钟冷却）
+2) 续期：拉 /dashboard 找实例 → 逐个拉 /vps/<uuid> 解析 "Renews until <UTC>"，按剩余时间提醒
+   - >48h 完全静默
+   - 48h 内每天一条
+   - 6h 内每小时一条
+3) cookie 失效 → TG 报警（6 小时冷却）
+状态落 state.json，由 Actions cache 滚动保存。
 """
+import calendar
+import html as H
 import json
 import os
 import re
 import sys
 import time
-import html as H
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -20,9 +24,12 @@ BASE = "https://openworld.eu.org"
 TARGET = BASE + "/createvps"
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/155.0.0.0 Safari/537.36")
-STOCK_COOLDOWN = 30 * 60      # 有货后 30 分钟内不重复推
-COOKIE_COOLDOWN = 6 * 3600    # cookie 失效 6 小时提醒一次
+STOCK_COOLDOWN = 30 * 60       # 有货后 30 分钟内不重复推
+COOKIE_COOLDOWN = 6 * 3600     # cookie 失效 6 小时提醒一次
+RENEW_DAILY_WINDOW = 48 * 3600  # 48h 内开始每天提醒
+RENEW_HOURLY_WINDOW = 6 * 3600  # 6h 内每小时提醒
 STATE_FILE = "state.json"
+REPO = "https://github.com/btpp03/openworld-stock-hermes"
 
 
 def log(*a):
@@ -76,15 +83,13 @@ def cookie_header():
     if not raw:
         return ""
     if "=" not in raw.split(";")[0]:
-        # 允许只用 __session 值
-        return "__session=" + raw
+        return "__session=" + raw   # 允许只放 __session 值
     return raw
 
 
 def fetch(path="/createvps"):
-    ck = cookie_header()
     req = urllib.request.Request(BASE + path, headers={
-        "Cookie": ck,
+        "Cookie": cookie_header(),
         "User-Agent": UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
@@ -104,6 +109,117 @@ def parse_plans(page):
     return plans
 
 
+def parse_renew_until(page):
+    """返回 [(epoch, 'YYYY-MM-DD HH:MM:SS')]，页面时间是 UTC。
+
+    页面结构: <span data-time="2026-11-02 22:16:56" data-time-tz>2026-11-02 22:16:56 (UTC)</span>
+    """
+    out = []
+    pats = [
+        r'data-time="(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"[^>]*data-time-tz',
+        r"Renews until[\s\S]{0,200}?(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})",
+    ]
+    seen = set()
+    for pat in pats:
+        for s in re.findall(pat, page):
+            try:
+                ep = calendar.timegm(time.strptime(s, "%Y-%m-%d %H:%M:%S"))
+            except Exception:
+                continue
+            if ep not in seen:
+                seen.add(ep)
+                out.append((ep, s))
+    return out
+
+
+def parse_instances(dash):
+    """从 /dashboard 里抓实例 uuid + 展示名 + 状态（按 data-vps-uuid 切块）。"""
+    insts = []
+    for seg in re.split(r'(?=<a href="/vps/)', dash)[1:]:
+        u = re.search(r'href="/vps/([0-9a-f\-]{36})"', seg)
+        if not u:
+            continue
+        nm = re.search(r'dash-hostname">([^<]+)<', seg)
+        st = (re.search(r'data-status="([a-z]+)"', seg)
+              or re.search(r'data-status-label>([A-Za-z]+)<', seg))
+        insts.append({
+            "uuid": u.group(1),
+            "name": (nm.group(1).strip() if nm else ""),
+            "status": (st.group(1).capitalize() if st else ""),
+        })
+        if len(insts) >= 50:
+            break
+    return insts
+
+
+def check_renew(st, now, quiet, force):
+    try:
+        status, url, dash = fetch("/dashboard")
+    except Exception as e:
+        log("[renew] dashboard 拉取失败:", e)
+        return
+    if "/login" in url or "sign in" in dash[:2000].lower():
+        log("[renew] 会话失效，跳过续期检查")
+        return
+    insts = parse_instances(dash)
+    log("[renew] 实例数=%d" % len(insts))
+    if not insts:
+        return
+    rows = []
+    for inst in insts:
+        try:
+            _, _, page = fetch("/vps/" + inst["uuid"])
+        except Exception as e:
+            log("[renew] 拉实例 %s 失败: %s" % (inst["uuid"], e))
+            continue
+        untils = parse_renew_until(page)
+        nm = inst["name"] or inst["uuid"][:8]
+        if not untils:
+            log("[renew] %s 未解析到到期时间" % nm)
+            continue
+        epoch, raw = min(untils)
+        rows.append({"uuid": inst["uuid"], "name": nm, "epoch": epoch,
+                     "raw": raw, "status": inst["status"]})
+        log("[renew] %s 到期北京 %s（剩 %.1f 小时）状态=%s"
+            % (nm, bj(epoch), (epoch - now) / 3600.0, inst["status"]))
+    if not rows:
+        return
+    rows.sort(key=lambda r: r["epoch"])
+    soon = rows[0]
+    left = soon["epoch"] - now
+
+    if left > RENEW_DAILY_WINDOW and not force:
+        log("[renew] 还剩 %.1f 小时 > 48h，静默" % (left / 3600.0))
+        return
+
+    if left > RENEW_HOURLY_WINDOW:
+        key = "renew_day"
+        stamp = bj(now)[:10]
+        if st.get(key) == stamp and not force:
+            log("[renew] 今日已提醒过，跳过")
+            return
+    else:
+        key = "renew_hour"
+        stamp = bj(now)[:13]
+        if st.get(key) == stamp and not force:
+            log("[renew] 本小时已提醒过，跳过")
+            return
+
+    st[key] = stamp
+    save_state(st)
+
+    hh = max(0.0, left / 3600.0)
+    urgent = "🔴 " if hh <= 6 else "🟡 "
+    msg = ("%sopenworld 实例 %s 还有 %.1f 小时到期（北京 %s）\n"
+           "状态: %s\n"
+           "→ 去续期: %s\n"
+           "（点 \"Renew free\"，续期也要过站方验证码，得你手点）\n%s"
+           % (urgent, soon["name"], hh, bj(soon["epoch"]),
+              soon["status"] or "未知", BASE + "/vps/" + soon["uuid"], REPO))
+    log("[renew] 提醒: %.1f 小时到期" % hh)
+    tg(msg, quiet=quiet and not force)
+
+
 def main():
     force = os.environ.get("FORCE", "").lower() in ("1", "true", "yes")
     quiet = os.environ.get("QUIET", "").lower() in ("1", "true", "yes")
@@ -112,16 +228,14 @@ def main():
 
     if not cookie_header():
         log("关键: 没有 OW_COOKIE")
-        tg("❌ openworld 库存监控：没有配置 OW_COOKIE\n"
-           "https://github.com/btpp03/openworld-stock-hermes")
+        tg("❌ openworld 监控：没有配置 OW_COOKIE\n" + REPO)
         return 2
 
     try:
-        status, url, page = fetch()
+        status, url, page = fetch("/createvps")
     except Exception as e:
         log("拉取失败:", e)
-        tg("⚠️ openworld 库存监控：拉取 /createvps 失败\n%s\n"
-           "https://github.com/btpp03/openworld-stock-hermes" % e)
+        tg("⚠️ openworld 监控：拉取 /createvps 失败\n%s\n%s" % (e, REPO))
         return 1
 
     log("http=%s url=%s len=%d" % (status, url, len(page)))
@@ -132,15 +246,13 @@ def main():
         log("  free plan: id=%s name=%s stock=%s node=%s"
             % (p.get("id"), p.get("name"), p.get("stock"), p.get("node_type")))
 
-    # cookie / 登录失效判定
     if not plans or "sign in" in page.lower() or url.rstrip("/").endswith("/login"):
         log("会话失效")
         if now - st.get("cookie_alert", 0) > COOKIE_COOLDOWN or force:
             st["cookie_alert"] = now
             save_state(st)
-            tg("⚠️ openworld 库存监控：登录会话失效，需要换 cookie\n"
-               "拉到的地址: %s\n"
-               "https://github.com/btpp03/openworld-stock-hermes" % url, quiet=quiet and not force)
+            tg("⚠️ openworld 监控：登录会话失效，需要换 cookie\n"
+               "拉到的地址: %s\n%s" % (url, REPO), quiet=quiet and not force)
         return 0
 
     save_state(st)  # 保留 cookie_alert
@@ -151,30 +263,30 @@ def main():
         st["last_stock"] = 0
         save_state(st)
         if force:
-            tg("ℹ️ openworld 库存监控自检正常：免费档当前 Out of stock\n"
-               "https://github.com/btpp03/openworld-stock-hermes")
-        return 0
-
-    p = avail[0]
-    locs = [l.get("name") for l in (p.get("locations") or [])]
-    msg = ("🚨 openworld 免费 VPS 有库存了！\n"
-           "计划: %s  stock=%s  节点: %s%s\n"
-           "规格: %s vCPU / %s MB RAM / %s GB 盘\n"
-           "→ 立刻下单: %s\n"
-           "（下单要过站方 6 阶段点选人机验证，得你手点）\n"
-           "https://github.com/btpp03/openworld-stock-hermes"
-           % (p.get("name"), p.get("stock"), p.get("node_type"),
-              (" / " + ", ".join(locs)) if locs else "",
-              p.get("cores") or p.get("vcpu") or 1, p.get("ram"), p.get("disk"), TARGET))
-    log("IN STOCK:", p.get("stock"))
-    if now - st.get("stock_alert", 0) > STOCK_COOLDOWN or force:
-        st["stock_alert"] = now
-        st["last_stock"] = p.get("stock")
-        save_state(st)
-        tg(msg)
+            tg("ℹ️ openworld 监控自检正常：免费档当前 Out of stock\n" + REPO)
     else:
-        log("[tg] 冷却期内，跳过（距上次 %d 分钟）"
-            % int((now - st.get("stock_alert", 0)) / 60))
+        p = avail[0]
+        locs = [l.get("name") for l in (p.get("locations") or [])]
+        msg = ("🚨 openworld 免费 VPS 有库存了！\n"
+               "计划: %s  stock=%s  节点: %s%s\n"
+               "规格: %s vCPU / %s MB RAM / %s GB 盘\n"
+               "→ 立刻下单: %s\n"
+               "（下单要过站方 6 阶段点选人机验证，得你手点）\n%s"
+               % (p.get("name"), p.get("stock"), p.get("node_type"),
+                  (" / " + ", ".join(locs)) if locs else "",
+                  p.get("cores") or p.get("vcpu") or 1, p.get("ram"), p.get("disk"),
+                  TARGET, REPO))
+        log("IN STOCK:", p.get("stock"))
+        if now - st.get("stock_alert", 0) > STOCK_COOLDOWN or force:
+            st["stock_alert"] = now
+            st["last_stock"] = p.get("stock")
+            save_state(st)
+            tg(msg)
+        else:
+            log("[tg] 冷却期内，跳过（距上次 %d 分钟）"
+                % int((now - st.get("stock_alert", 0)) / 60))
+
+    check_renew(st, now, quiet, force)
     return 0
 
 
