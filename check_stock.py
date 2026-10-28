@@ -87,16 +87,27 @@ def cookie_header():
     return raw
 
 
-def fetch(path="/createvps"):
-    req = urllib.request.Request(BASE + path, headers={
-        "Cookie": cookie_header(),
-        "User-Agent": UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": BASE + "/dashboard",
-    })
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.status, r.geturl(), r.read().decode("utf-8", "ignore")
+def fetch(path="/createvps", attempts=3, backoff=(5, 15)):
+    """单次 SSL/连接抖动不该报警：内层重试 attempts 次。"""
+    last = None
+    for i in range(attempts):
+        req = urllib.request.Request(BASE + path, headers={
+            "Cookie": cookie_header(),
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": BASE + "/dashboard",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, r.geturl(), r.read().decode("utf-8", "ignore")
+        except Exception as e:
+            last = e
+            log("[fetch] 第 %d/%d 次失败: %s" % (i + 1, attempts, e))
+            if i < attempts - 1:
+                time.sleep(backoff[min(i, len(backoff) - 1)])
+    raise last
+
 
 
 def parse_plans(page):
@@ -233,9 +244,16 @@ def main():
 
     try:
         status, url, page = fetch("/createvps")
+        st["fetch_fail"] = 0
     except Exception as e:
-        log("拉取失败:", e)
-        tg("⚠️ openworld 监控：拉取 /createvps 失败\n%s\n%s" % (e, REPO))
+        fails = int(st.get("fetch_fail") or 0) + 1
+        st["fetch_fail"] = fails
+        save_state(st)
+        log("拉取失败（连续 %d 次）: %s" % (fails, e))
+        if fails >= 3 or force:
+            tg("⚠️ openworld 监控：连续 %d 轮拉不到 /createvps\n%s\n%s" % (fails, e, REPO))
+        else:
+            log("[tg] 抖动容忍中，不报警（%d/3）" % fails)
         return 1
 
     log("http=%s url=%s len=%d" % (status, url, len(page)))
