@@ -242,19 +242,38 @@ def main():
         tg("❌ openworld 监控：没有配置 OW_COOKIE\n" + REPO)
         return 2
 
+    FAIL_ALERT_AFTER = 6          # 连续 6 轮（约 12 分钟）才算站点真挂了
+    FAIL_REPEAT = 3600            # 挂了之后每小时最多再提一次
     try:
         status, url, page = fetch("/createvps")
-        st["fetch_fail"] = 0
     except Exception as e:
         fails = int(st.get("fetch_fail") or 0) + 1
         st["fetch_fail"] = fails
+        if fails == 1:
+            st["fetch_first"] = now
         save_state(st)
-        log("拉取失败（连续 %d 次）: %s" % (fails, e))
-        if fails >= 3 or force:
-            tg("⚠️ openworld 监控：连续 %d 轮拉不到 /createvps\n%s\n%s" % (fails, e, REPO))
+        first = st.get("fetch_first") or now
+        mins = int((now - first) / 60)
+        log("拉取失败（连续 %d 次，已 %d 分钟）: %s" % (fails, mins, e))
+        alerted = st.get("fail_alerted")
+        if force or (fails == FAIL_ALERT_AFTER and not alerted) or \
+           (fails > FAIL_ALERT_AFTER and now - (alerted or 0) > FAIL_REPEAT):
+            st["fail_alerted"] = now
+            save_state(st)
+            tg("🔧 openworld 站点打不开了（已 %d 分钟）\n%s" % (mins, e))
         else:
-            log("[tg] 抖动容忍中，不报警（%d/3）" % fails)
+            log("[tg] 不重复报警（连续 %d 轮，上次提示 %s）"
+                % (fails, "有" if alerted else "无"))
         return 1
+
+    # 恢复正常
+    if int(st.get("fetch_fail") or 0) >= FAIL_ALERT_AFTER:
+        mins = int((now - (st.get("fetch_first") or now)) / 60)
+        tg("✅ openworld 站点已恢复（断了约 %d 分钟）" % max(mins, 1))
+        log("[tg] 已发恢复通知，断 %d 分钟" % mins)
+    st["fetch_fail"] = 0
+    st["fetch_first"] = 0
+    st["fail_alerted"] = 0
 
     log("http=%s url=%s len=%d" % (status, url, len(page)))
     plans = parse_plans(page)
@@ -285,15 +304,15 @@ def main():
     else:
         p = avail[0]
         locs = [l.get("name") for l in (p.get("locations") or [])]
-        msg = ("🚨 openworld 免费 VPS 有库存了！\n"
-               "计划: %s  stock=%s  节点: %s%s\n"
-               "规格: %s vCPU / %s MB RAM / %s GB 盘\n"
-               "→ 立刻下单: %s\n"
-               "（下单要过站方 6 阶段点选人机验证，得你手点）\n%s"
-               % (p.get("name"), p.get("stock"), p.get("node_type"),
-                  (" / " + ", ".join(locs)) if locs else "",
-                  p.get("cores") or p.get("vcpu") or 1, p.get("ram"), p.get("disk"),
-                  TARGET, REPO))
+        disk = p.get("disk") or 0
+        disk_s = ("%d GB" % round(disk / 1024)) if disk >= 1000 else ("%s MB" % disk)
+        msg = ("🚨 免费位有货 stock=%s\n"
+               "%s\n"
+               "%s vCPU / %s MB / %s · %s\n"
+               "（6 阶段点选，慢一步就没了）"
+               % (p.get("stock"), TARGET,
+                  p.get("cores") or p.get("vcpu") or 1, p.get("ram"), disk_s,
+                  ", ".join(locs) if locs else (p.get("node_type") or "")))
         log("IN STOCK:", p.get("stock"))
         if now - st.get("stock_alert", 0) > STOCK_COOLDOWN or force:
             st["stock_alert"] = now
