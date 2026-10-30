@@ -256,21 +256,14 @@ def main():
         mins = int((now - first) / 60)
         log("拉取失败（连续 %d 次，已 %d 分钟）: %s" % (fails, mins, e))
         alerted = st.get("fail_alerted")
-        if force or (fails == FAIL_ALERT_AFTER and not alerted) or \
-           (fails > FAIL_ALERT_AFTER and now - (alerted or 0) > FAIL_REPEAT):
-            st["fail_alerted"] = now
-            save_state(st)
-            tg("🔧 openworld 站点打不开了（已 %d 分钟）\n%s" % (mins, e))
-        else:
-            log("[tg] 不重复报警（连续 %d 轮，上次提示 %s）"
-                % (fails, "有" if alerted else "无"))
+        # 用户明确要求：站点故障/恢复都不要推 TG，只写日志（只有"有货"才推送）
+        log("[tg] 静默（连续 %d 轮失败，不打扰）" % fails)
         return 1
 
-    # 恢复正常
+    # 恢复正常（同样不推送，只记日志）
     if int(st.get("fetch_fail") or 0) >= FAIL_ALERT_AFTER:
         mins = int((now - (st.get("fetch_first") or now)) / 60)
-        tg("✅ openworld 站点已恢复（断了约 %d 分钟）" % max(mins, 1))
-        log("[tg] 已发恢复通知，断 %d 分钟" % mins)
+        log("[recover] 站点恢复，断了约 %d 分钟（不推送）" % mins)
     st["fetch_fail"] = 0
     st["fetch_first"] = 0
     st["fail_alerted"] = 0
@@ -288,8 +281,9 @@ def main():
         if now - st.get("cookie_alert", 0) > COOKIE_COOLDOWN or force:
             st["cookie_alert"] = now
             save_state(st)
-            tg("⚠️ openworld 监控：登录会话失效，需要换 cookie\n"
-               "拉到的地址: %s\n%s" % (url, REPO), quiet=quiet and not force)
+            tg("⚠️ openworld 登录失效，监控暂时看不到库存\n"
+               "（我这边需要重登一次，重登前不会推有货通知）",
+               quiet=quiet and not force)
         return 0
 
     save_state(st)  # 保留 cookie_alert
